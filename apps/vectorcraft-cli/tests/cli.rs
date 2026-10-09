@@ -83,6 +83,41 @@ fn mcp_headless_over_stdio() {
     assert_eq!(replies[3]["result"]["content"][0]["type"], "image");
 }
 
+#[test]
+fn content_bundle_writes_editable_exports_and_a_review_only_manifest() {
+    let template = tmp("content-bundle-template.svg");
+    let output_dir = tmp("content-bundle-output");
+    std::fs::write(
+        &template,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="500" viewBox="0 0 400 500"><rect width="400" height="500" fill="#6B1E2E"/><text x="40" y="250" fill="#F2EEE7" font-size="36">Golden Maple</text></svg>"##,
+    )
+    .unwrap();
+
+    let out = Command::new(BIN)
+        .args([
+            "content-bundle",
+            "--template",
+            template.to_str().unwrap(),
+            "--out",
+            output_dir.to_str().unwrap(),
+            "--name",
+            "golden-maple-project-reveal",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(output_dir.join("golden-maple-project-reveal.editable.svg").is_file());
+    assert_eq!(&std::fs::read(output_dir.join("golden-maple-project-reveal.png")).unwrap()[..4], b"\x89PNG");
+    assert!(output_dir.join("golden-maple-project-reveal.webp").is_file());
+    assert!(output_dir.join("golden-maple-project-reveal.pdf").is_file());
+    let manifest: Value = serde_json::from_slice(&std::fs::read(output_dir.join("golden-maple-project-reveal.manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["status"], "draft");
+    assert_eq!(manifest["approved"], false);
+    assert_eq!(manifest["publishing"], "not_authorized");
+    assert_eq!(manifest["review_required"], true);
+}
+
 /// End-to-end protocol sweep over stdio against the compiled binary. The in-process
 /// tests drive `Server::handle_line` directly, so the binary's own wiring (argument
 /// parsing, logger install, stdout pollution, notification order) is untested: this

@@ -80,6 +80,10 @@ USAGE:
       IN left things out (hidden text, art or layers it could not read; the notes say which) unless
       --replace-lossy is given.
 
+  vectorcraft-cli content-bundle --template FILE --out DIR --name STEM [--scale N]
+      Create a draft-only content bundle: an editable template copy, PNG, WebP and PDF exports, and
+      a JSON review manifest. This command never publishes, sends or uploads content.
+
   vectorcraft-cli info FILE
       Print a JSON summary: the import warnings (what didn't come in as it was, such as an EPS
       read from its preview and why), title, colour mode, units, artboards, object counts by
@@ -110,6 +114,7 @@ fn main() -> ExitCode {
         Some("run") => run(&args[1..]),
         Some("commands") => commands(),
         Some("convert") => convert(&args[1..]),
+        Some("content-bundle") => content_bundle(&args[1..]),
         Some("info") => info(&args[1..]),
         Some("bench") => bench(&args[1..]),
         Some("perf") => perf::run(&args[1..]),
@@ -195,6 +200,87 @@ fn convert(args: &[String]) -> Result<(), String> {
     let params = json!({"path": output, "scale": scale, "artboard": artboard, "range": range, "outlineText": outline_text, "hiddenLayers": true, "acknowledgeLoss": replace_lossy});
     let r = h.call("engine.execute", json!({"command": "document.export", "params": params})).map_err(|e| format!("export {output}: {e}"))?;
     outln!("{r}");
+    Ok(())
+}
+
+fn export_file(input: &str, output: &str, scale: f64) -> Result<Value, String> {
+    let mut h = Headless::new();
+    h.call("app.open", json!({"path": input})).map_err(|e| format!("open {input}: {e}"))?;
+    h.call("engine.execute", json!({"command": "document.export", "params": {"path": output, "scale": scale, "hiddenLayers": true}}))
+        .map_err(|e| format!("export {output}: {e}"))
+}
+
+#[derive(Debug, PartialEq)]
+struct ContentBundleArgs {
+    template: String,
+    output_dir: String,
+    name: String,
+    scale: f64,
+}
+
+fn parse_content_bundle(args: &[String]) -> Result<ContentBundleArgs, String> {
+    let mut template = None;
+    let mut output_dir = None;
+    let mut name = None;
+    let mut scale = 2.0;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value = |label: &str, it: &mut std::slice::Iter<'_, String>| it.next().cloned().ok_or_else(|| format!("{arg} needs {label}"));
+        match arg.as_str() {
+            "--template" => template = Some(value("a file", &mut it)?),
+            "--out" => output_dir = Some(value("a directory", &mut it)?),
+            "--name" => name = Some(value("a simple file stem", &mut it)?),
+            "--scale" => {
+                let raw = value("a number", &mut it)?;
+                scale = raw.parse::<f64>().map_err(|_| format!("--scale {raw}: not a number"))?;
+            }
+            other => return Err(format!("unknown content-bundle option `{other}`")),
+        }
+    }
+    let template = template.ok_or("content-bundle needs --template FILE")?;
+    let output_dir = output_dir.ok_or("content-bundle needs --out DIR")?;
+    let name = name.ok_or("content-bundle needs --name STEM")?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("--name must be a simple file stem using letters, numbers, hyphens or underscores".into());
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("--scale must be a positive finite number".into());
+    }
+    Ok(ContentBundleArgs { template, output_dir, name, scale })
+}
+
+fn content_bundle(args: &[String]) -> Result<(), String> {
+    let bundle = parse_content_bundle(args)?;
+    let template = std::path::Path::new(&bundle.template);
+    let extension = template.extension().and_then(|ext| ext.to_str()).ok_or("--template needs a file extension")?;
+    if !template.is_file() {
+        return Err(format!("template is not a readable file: {}", bundle.template));
+    }
+    let output_dir = std::path::Path::new(&bundle.output_dir);
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("create {}: {e}", output_dir.display()))?;
+
+    let editable = output_dir.join(format!("{}.editable.{extension}", bundle.name));
+    std::fs::copy(template, &editable).map_err(|e| format!("copy {}: {e}", editable.display()))?;
+    let mut artifacts = vec![editable.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string()];
+    for extension in ["png", "webp", "pdf"] {
+        let output = output_dir.join(format!("{}.{}", bundle.name, extension));
+        let output_text = output.to_str().ok_or("output path is not valid Unicode")?;
+        export_file(&bundle.template, output_text, bundle.scale)?;
+        artifacts.push(output.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string());
+    }
+    let manifest = output_dir.join(format!("{}.manifest.json", bundle.name));
+    let review = json!({
+        "status": "draft",
+        "approved": false,
+        "review_required": true,
+        "publishing": "not_authorized",
+        "template": bundle.template,
+        "artifacts": artifacts,
+        "scale": bundle.scale,
+    });
+    let review_text = serde_json::to_string_pretty(&review).map_err(|e| e.to_string())?;
+    std::fs::write(&manifest, format!("{review_text}\n")).map_err(|e| format!("write {}: {e}", manifest.display()))?;
+    outln!("{}", json!({"status": "draft", "manifest": manifest, "publishing": "not_authorized"}));
     Ok(())
 }
 
@@ -318,4 +404,49 @@ fn bench(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod content_bundle_tests {
+    use super::parse_content_bundle;
+
+    #[test]
+    fn accepts_template_output_name_and_optional_scale() {
+        let args = vec![
+            "--template".to_string(),
+            "golden-maple-project-reveal.svg".to_string(),
+            "--out".to_string(),
+            "drafts".to_string(),
+            "--name".to_string(),
+            "project-reveal".to_string(),
+            "--scale".to_string(),
+            "2".to_string(),
+        ];
+        let bundle = parse_content_bundle(&args).unwrap();
+        assert_eq!(bundle.template, "golden-maple-project-reveal.svg");
+        assert_eq!(bundle.output_dir, "drafts");
+        assert_eq!(bundle.name, "project-reveal");
+        assert_eq!(bundle.scale, 2.0);
+    }
+
+    #[test]
+    fn rejects_names_that_could_escape_the_output_directory() {
+        let args = vec![
+            "--template".to_string(),
+            "template.svg".to_string(),
+            "--out".to_string(),
+            "drafts".to_string(),
+            "--name".to_string(),
+            "../publish-me".to_string(),
+        ];
+        let error = parse_content_bundle(&args).unwrap_err();
+        assert!(error.contains("simple file stem"));
+    }
+
+    #[test]
+    fn rejects_missing_required_arguments() {
+        let args = vec!["--template".to_string(), "template.svg".to_string()];
+        let error = parse_content_bundle(&args).unwrap_err();
+        assert!(error.contains("--out"));
+    }
 }
